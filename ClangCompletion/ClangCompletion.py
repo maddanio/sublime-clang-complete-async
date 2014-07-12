@@ -11,6 +11,7 @@ import queue
 from clang_completion import ClangCompletion
 
 #todo: add autocompletion on-demand
+#todo: fix member completion
 #todo: add "go to definition" all the way down...
 #todo: add "fix-it" hints for diagnostics all the way down...
 
@@ -38,6 +39,7 @@ class CompletionHandler:
 		self.completion_server = None
 		self.update_timer = None
 		self.views = [view]
+		self.unsaved_source = None
 		sublime.set_timeout_async(self.start, 0)
 
 	def start(self):
@@ -59,14 +61,33 @@ class CompletionHandler:
 		self.views.append(view)
 		self.__update_diagnostic_display(view)
 
-	def handle_modified(self):
+	def handle_modified(self, unsaved_source = None):
+		for view in self.views:
+			view.set_status("clang", "clang: updating diagnostics")
+			view.add_regions("clang_warnings", [])
+			view.add_regions("clang_errors", [])
 		self.modification_time = time.time()
+		self.unsaved_source = unsaved_source
 		self.__update_later()
 
 	def complete_at(self, content, row, column):
 		self.__update_later()
 		completions = self.completion_server.complete(row, column, unsaved_source = content)
 		return ([self.__convert_completion(completion) for completion in completions], sublime.INHIBIT_EXPLICIT_COMPLETIONS)
+
+	def handle_selection_modified(self, view):
+		found_diagnostic = None
+		selection = view.sel()
+		if len(selection) == 1:
+			for diagnonstic in self.diagnostics:
+				if diagnonstic["region"].intersects(selection[0]):
+					found_diagnostic = diagnonstic
+					break
+		if found_diagnostic:
+			text = found_diagnostic["info"].get("type", "diagnostic") + ": " + found_diagnostic["info"]["text"]
+			view.set_status("diagnonstic", text)
+		else:
+			view.erase_status("diagnonstic")
 
 	def __update_later(self):
 		if self.update_timer:
@@ -75,8 +96,16 @@ class CompletionHandler:
 		self.update_timer = threading.Timer(0.5, self.__update)
 		self.update_timer.start()
 
-	def __update_diagnostics(self, unsaved_source = None):
-		diagnostics = self.completion_server.check(unsaved_source = unsaved_source)
+	def __process_argument(self, arg):
+		return arg.replace("${project_path}", self.project_path)
+
+	def __update(self):
+		if not self.update_time or self.update_time < self.modification_time:
+			self.update_time = time.time()
+			self.__update_diagnostics()
+
+	def __update_diagnostics(self):
+		diagnostics = self.completion_server.check(unsaved_source = self.unsaved_source)
 		error_regions = []
 		warning_regions = []
 		self.diagnostics = []
@@ -87,14 +116,6 @@ class CompletionHandler:
 				self.diagnostics.append({"region" : region, "info" : diagnostic})
 		for view in self.views:
 			self.__update_diagnostic_display(view)
-
-	def __process_argument(self, arg):
-		return arg.replace("${project_path}", self.project_path)
-
-	def __update(self):
-		if not self.update_time or self.update_time < self.modification_time:
-			self.update_time = time.time()
-			self.__update_diagnostics()
 
 	def __convert_completion(self, completion):
 		label = completion[0]
@@ -120,6 +141,7 @@ class CompletionHandler:
 		view.add_regions("clang_warnings", warning_regions, "comment", "circle", sublime.DRAW_OUTLINED)
 		view.add_regions("clang_errors", error_regions, "invalid", "circle", sublime.DRAW_OUTLINED)
 		view.set_status("clang", "clang: %d errors and %d warnings" % (len(error_regions), len(warning_regions)))
+		self.handle_selection_modified(view)
 
 class ClangCompletionPlugin(sublime_plugin.EventListener):
 	def __init__(self):
@@ -160,25 +182,13 @@ class ClangCompletionPlugin(sublime_plugin.EventListener):
 	def on_selection_modified(self, view):
 		filename = view.file_name()
 		handler = self.handlers.get(filename)
-		found_diagnostic = None
 		if handler:
-			selection = view.sel()
-			if len(selection) == 1:
-				for diagnonstic in handler.diagnostics:
-					if diagnonstic["region"].intersects(selection[0]):
-						found_diagnostic = diagnonstic
-						break
-		if found_diagnostic:
-			text = found_diagnostic["info"].get("type", "diagnostic") + ": " + found_diagnostic["info"]["text"]
-			view.set_status("diagnonstic", text)
-		else:
-			view.erase_status("diagnonstic")
+			handler.handle_selection_modified(view)
 
 	def on_modified(self, view):
 		handler = self.handlers.get(view.file_name())
 		if handler:
-			handler.handle_modified()
-			self.on_selection_modified(view)
+			handler.handle_modified(view.substr(sublime.Region(0, view.size())))
 
 	def on_query_completions(self, view, prefix, locations):
 		handler = self.handlers.get(view.file_name())
@@ -188,7 +198,6 @@ class ClangCompletionPlugin(sublime_plugin.EventListener):
 			content = view.substr(sublime.Region(0, view.size()))
 			(row, column) = view.rowcol(locations[0])
 			completions = handler.complete_at(content, row, column)
-			print("got %i completions" % len(completions))
 			return completions
 
 # this works around the fact that currently on_activated is not called upon startup
